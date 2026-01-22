@@ -1,13 +1,10 @@
+
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter_barcode_listener/flutter_barcode_listener.dart';
-import 'dart:io';
-import 'package:excel/excel.dart';
+import 'package:get_it/get_it.dart';
 import 'package:intl/intl.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:share_plus/share_plus.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
-import 'package:flutter/material.dart' hide Border;
+import '../../../../core/network/api_client.dart';
 
 class ScanHistoryScreen extends StatefulWidget {
   const ScanHistoryScreen({super.key});
@@ -19,201 +16,97 @@ class ScanHistoryScreen extends StatefulWidget {
 class _ScanHistoryScreenState extends State<ScanHistoryScreen> {
   final TextEditingController _searchController = TextEditingController();
   final FocusNode _searchFocus = FocusNode();
-  QuerySnapshot? _searchResult;
+  List<dynamic>? _historyList;
   bool _isLoading = false;
 
-  void _openCameraScanner() {
-    showModalBottomSheet(
+  @override
+  void initState() {
+    super.initState();
+    // Auto-focus for hardware scanner support
+    WidgetsBinding.instance.addPostFrameCallback((_) => _searchFocus.requestFocus());
+  }
+
+  // --- BUSINESS LOGIC ---
+
+  void _searchData(String query) async {
+    if (query.isEmpty) return;
+    setState(() {
+      _isLoading = true;
+      _historyList = null;
+    });
+
+    try {
+      final response = await GetIt.I<ApiClient>().get(
+        '/api/dispatches/',
+        queryParams: {'search': query.trim()},
+      );
+
+      setState(() {
+        _historyList = response.data['data'];
+        _isLoading = false;
+      });
+
+      if (_historyList == null || _historyList!.isEmpty) {
+        _showSnackBar("No records found for: $query", Colors.orange);
+      }
+    } catch (e) {
+      setState(() => _isLoading = false);
+      _showSnackBar("Server Error: $e", Colors.red);
+    }
+    _searchFocus.requestFocus();
+  }
+
+  void _viewImage(String? relativeUrl) {
+    if (relativeUrl == null) return;
+    showDialog(
       context: context,
-      isScrollControlled: true,
-      builder: (context) => SizedBox(
-        height: MediaQuery.of(context).size.height * 0.7,
+      builder: (_) => Dialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            AppBar(
-              title: const Text("Scan to Search"),
-              leading: IconButton(
-                icon: const Icon(Icons.close),
-                onPressed: () => Navigator.pop(context),
-              ),
-            ),
-            Expanded(
-              child: MobileScanner(
-                onDetect: (capture) {
-                  final List<Barcode> barcodes = capture.barcodes;
-                  if (barcodes.isNotEmpty) {
-                    final String code = barcodes.first.rawValue ?? "";
-                    if (code.isNotEmpty) {
-                      Navigator.pop(context);
-                      _searchController.text = code;
-                      _searchData(code); // Trigger your existing logic
-                    }
-                  }
+            ClipRRect(
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+              child: Image.network(
+                "http://10.11.35.96:8000$relativeUrl", // Use your server base
+                loadingBuilder: (context, child, loadingProgress) {
+                  if (loadingProgress == null) return child;
+                  return const SizedBox(height: 200, child: Center(child: CircularProgressIndicator()));
                 },
+                errorBuilder: (context, error, stackTrace) => const SizedBox(
+                  height: 200,
+                  child: Icon(Icons.broken_image, size: 50, color: Colors.grey),
+                ),
               ),
             ),
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text("CLOSE")),
           ],
         ),
       ),
     );
   }
 
-  void _searchData(String query) async {
-    if (query.isEmpty) return;
-    setState(() {
-      _isLoading = true;
-      _searchResult = null;
-    });
 
-    try {
-      final String searchTerm = query.trim();
-      var result = await FirebaseFirestore.instance
-          .collection('dispatches')
-          .where(
-        Filter.or(
-          Filter('billNo', isEqualTo: searchTerm),
-          Filter('customerPin', isEqualTo: searchTerm),
-        ),
-      )
-          .get();
-
-      if (result.docs.isEmpty) {
-        var fallbackQuery = await FirebaseFirestore.instance
-            .collection('dispatches')
-            .orderBy('timestamp', descending: true)
-            .limit(20)
-            .get();
-
-        final List<DocumentSnapshot> filteredDocs = fallbackQuery.docs.where((doc) {
-          final List items = doc.get('items') ?? [];
-          return items.any((item) => item['barcode'] == searchTerm);
-        }).toList();
-
-        if (filteredDocs.isNotEmpty) {
-          setState(() {
-            _searchResult = fallbackQuery;
-            _isLoading = false;
-          });
-          _showSnackBar("Barcode found in recent records", Colors.blue);
-          return;
-        }
-      }
-
-      setState(() {
-        _searchResult = result;
-        _isLoading = false;
-      });
-
-      if (result.docs.isEmpty) {
-        _showSnackBar("No record found for: $searchTerm", Colors.orange);
-      }
-    } catch (e) {
-      setState(() {
-        _isLoading = false;
-        _searchResult = null;
-      });
-      _showSnackBar("Search Error: $e", Colors.red);
-    }
-  }
-
-  void _showSnackBar(String msg, Color color) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(msg), backgroundColor: color, duration: const Duration(seconds: 2)),
-    );
-  }
-
-  Future<void> _exportToExcel() async {
-    if (_searchResult == null || _searchResult!.docs.isEmpty) {
-      _showSnackBar("Search for a bill first", Colors.orange);
-      return;
-    }
-
-    try {
-      var excel = Excel.createExcel();
-      final data = _searchResult!.docs.first.data() as Map<String, dynamic>;
-      final String billNo = data['billNo'] ?? "Dispatch";
-
-      // Prepare Sheet
-      excel.rename('Sheet1', billNo);
-      Sheet sheet = excel[billNo];
-
-      // Styling
-      var headerStyle = CellStyle(
-        backgroundColorHex: ExcelColor.fromHexString('#1E293B'),
-        fontColorHex: ExcelColor.fromHexString('#FFFFFF'),
-        bold: true,
-        horizontalAlign: HorizontalAlign.Center,
-      );
-
-      List<CellValue> headers = ["S.No", "BARCODE", "TYPE", "GWT", "LOOSE QTY", "NO OF B", "QTY"]
-          .map((e) => TextCellValue(e)).toList();
-      sheet.appendRow(headers);
-
-      for (var i = 0; i < headers.length; i++) {
-        sheet.cell(CellIndex.indexByColumnRow(columnIndex: i, rowIndex: 0)).cellStyle = headerStyle;
-      }
-
-      final List items = data['items'] ?? [];
-      for (var item in items) {
-        sheet.appendRow([
-          TextCellValue(item['sno']?.toString() ?? ''),
-          TextCellValue(item['barcode']?.toString() ?? ''),
-          TextCellValue(item['type']?.toString() ?? ''),
-          TextCellValue(item['gwt']?.toString() ?? 'STD'),
-          TextCellValue(item['loose']?.toString() ?? '0'),
-          TextCellValue(item['noOfB']?.toString() ?? '0'),
-          TextCellValue(item['qty']?.toString() ?? '0'),
-        ]);
-      }
-
-      String path;
-      if (Platform.isAndroid) {
-        final dir = await getExternalStorageDirectory();
-        path = "${dir!.path}/${billNo}_${DateFormat('yyyyMMdd_HHmm').format(DateTime.now())}.xlsx";
-      } else {
-        final dir = await getApplicationDocumentsDirectory();
-        path = "${dir.path}/${billNo}_${DateFormat('yyyyMMdd_HHmm').format(DateTime.now())}.xlsx";
-      }
-
-      final fileBytes = excel.save();
-      if (fileBytes != null) {
-        final file = File(path);
-
-        await file.create(recursive: true);
-        await file.writeAsBytes(fileBytes, flush: true);
-
-        _showSnackBar("File Saved: ${file.path}", Colors.green);
-
-        await Share.shareXFiles(
-            [XFile(path)],
-            text: 'Dispatch Manifest: $billNo'
-        );
-      }
-    } catch (e) {
-      print("Export/Save Error: $e");
-      _showSnackBar("Error: $e", Colors.red);
-    }
-  }
+  // --- UI COMPONENTS ---
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFFF8FAFC),
       appBar: AppBar(
-        title: const Text("Dispatch History", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+        title: const Text("Archive Explorer", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
         backgroundColor: Colors.white,
         elevation: 0.5,
         actions: [
-          IconButton(onPressed: () {}, icon: const Icon(Icons.print_rounded, color: Colors.blue)),
-          IconButton(onPressed: _exportToExcel, icon: const Icon(Icons.description_rounded, color: Colors.green)),
+          IconButton(onPressed: (){}, icon: const Icon(Icons.description_rounded, color: Colors.green)),
         ],
       ),
       body: BarcodeKeyboardListener(
         onBarcodeScanned: _searchData,
         child: Column(
           children: [
-            _buildSearchHeader(),
-            if (_isLoading) const LinearProgressIndicator(),
+            _buildProfessionalSearchHeader(),
+            if (_isLoading) const LinearProgressIndicator(color: Colors.blueAccent),
             Expanded(child: _buildHistoryContent()),
           ],
         ),
@@ -221,33 +114,30 @@ class _ScanHistoryScreenState extends State<ScanHistoryScreen> {
     );
   }
 
-  Widget _buildSearchHeader() {
+  Widget _buildProfessionalSearchHeader() {
     return Container(
       padding: const EdgeInsets.all(16),
-      color: Colors.white,
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.vertical(bottom: Radius.circular(20)),
+        boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 10, offset: Offset(0, 4))],
+      ),
       child: TextField(
         controller: _searchController,
         focusNode: _searchFocus,
-        autofocus: true,
         decoration: InputDecoration(
-          hintText: "Scan Bill No, Pin, or Barcode...",
-          prefixIcon: const Icon(Icons.qr_code_scanner, color: Colors.blueAccent),
+          hintText: "Scan Bill, PIN or Barcode",
+          prefixIcon: const Icon(Icons.qr_code_scanner_rounded, color: Colors.blueAccent),
           suffixIcon: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              IconButton(
-                icon: const Icon(Icons.camera_alt, color: Colors.blueAccent),
-                onPressed: _openCameraScanner,
-              ),
-              IconButton(
-                icon: const Icon(Icons.search),
-                onPressed: () => _searchData(_searchController.text),
-              ),
+              IconButton(icon: const Icon(Icons.camera_alt_rounded, color: Colors.blueAccent), onPressed: _openCameraScanner),
+              IconButton(icon: const Icon(Icons.search_rounded), onPressed: () => _searchData(_searchController.text)),
             ],
           ),
           filled: true,
           fillColor: const Color(0xFFF1F5F9),
-          border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none),
         ),
         onSubmitted: _searchData,
       ),
@@ -255,77 +145,136 @@ class _ScanHistoryScreenState extends State<ScanHistoryScreen> {
   }
 
   Widget _buildHistoryContent() {
-    if (_searchResult == null || _searchResult!.docs.isEmpty) return _emptyState();
+    if (_historyList == null || _historyList!.isEmpty) return _emptyState();
 
     return ListView.builder(
       padding: const EdgeInsets.all(16),
-      itemCount: _searchResult!.docs.length,
-      itemBuilder: (context, index) {
-        final data = _searchResult!.docs[index].data() as Map<String, dynamic>;
-        final List items = data['items'] ?? [];
-        return Column(
-          children: [
-            _buildInfoSummary(data),
-            const SizedBox(height: 15),
-            _buildDataTable(items),
-            const SizedBox(height: 30),
-          ],
+      itemCount: _historyList!.length,
+      itemBuilder: (context, billIndex) {
+        final data = _historyList![billIndex];
+        return Container(
+          margin: const EdgeInsets.only(bottom: 20),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(15),
+            border: Border.all(color: Colors.grey.shade200),
+          ),
+          child: ExpansionTile(
+            initiallyExpanded: true,
+            title: Text("BILL: ${data['bill_no']}", style: const TextStyle(fontWeight: FontWeight.bold)),
+            subtitle: Text("PIN: ${data['customer_pin']} • Date: ${data['created_at'].toString().substring(0, 10)}"),
+            children: [_buildProfessionalTable(data['items'] ?? [])],
+          ),
         );
       },
     );
   }
 
-  Widget _buildInfoSummary(Map<String, dynamic> data) {
+/*
+  Widget _buildProfessionalTable(List items) {
     return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(color: const Color(0xFF1E293B), borderRadius: BorderRadius.circular(12)),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          _infoTile("BILL NO", data['billNo'] ?? '-'),
-          _infoTile("STATUS", data['status'] ?? 'Verified'),
-        ],
+      width: double.infinity,
+      decoration: BoxDecoration(color: const Color(0xFFFBFDFF), borderRadius: BorderRadius.circular(15)),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: DataTable(
+          headingRowColor: WidgetStateProperty.all(const Color(0xFFF8FAFC)),
+          columnSpacing: 24,
+          columns: const [
+            DataColumn(label: Text('SNO', style: TextStyle(fontWeight: FontWeight.bold))),
+            DataColumn(label: Text('BARCODE', style: TextStyle(fontWeight: FontWeight.bold))),
+            DataColumn(label: Text('TYPE', style: TextStyle(fontWeight: FontWeight.bold))),
+            DataColumn(label: Text('GWT', style: TextStyle(fontWeight: FontWeight.bold))),
+            DataColumn(label: Text('QTY', style: TextStyle(fontWeight: FontWeight.bold))),
+            DataColumn(label: Text('PHOTO', style: TextStyle(fontWeight: FontWeight.bold))),
+            DataColumn(label: Text('DATE', style: TextStyle(fontWeight: FontWeight.bold))),
+
+          ],
+          rows: items.map((item) => DataRow(cells: [
+            DataCell(Text(item['sno']?.toString() ?? '-')),
+            DataCell(Text(item['barcode'] ?? '-')),
+            DataCell(Text(item['item_type'] ?? '-')),
+            DataCell(Text(item['gwt'] ?? '-')),
+            DataCell(Text(item['qty']?.toString() ?? '0')),
+            DataCell(IconButton(
+              icon: const Icon(Icons.image_search_rounded, color: Colors.blueAccent),
+              onPressed: () => _viewImage(item['image']),
+            )),
+            DataCell(Text(item['created_at']?.toString() ?? '0')),
+
+          ])).toList(),
+        ),
       ),
     );
   }
+*/
 
-  Widget _infoTile(String l, String v) => Column(
-    children: [
-      Text(l, style: const TextStyle(color: Colors.white54, fontSize: 9, fontWeight: FontWeight.bold)),
-      Text(v, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold)),
-    ],
-  );
 
-  Widget _buildDataTable(List items) {
+  Widget _buildProfessionalTable(List items) {
     return Container(
       width: double.infinity,
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
+        color: const Color(0xFFFBFDFF),
+        borderRadius: const BorderRadius.vertical(bottom: Radius.circular(15)),
+        border: Border.all(color: Colors.grey.shade200),
       ),
       child: SingleChildScrollView(
         scrollDirection: Axis.horizontal,
         child: DataTable(
-          // Added TableBorder for professional look
-          border: TableBorder.all(color: Colors.grey.shade200, borderRadius: BorderRadius.circular(12)),
+          headingRowHeight: 45,
+          dataRowMaxHeight: 60, // Increased height to accommodate two-line date/time
           headingRowColor: WidgetStateProperty.all(const Color(0xFFF8FAFC)),
+          columnSpacing: 20,
+          border: TableBorder(
+            verticalInside: BorderSide(color: Colors.grey.shade100, width: 1),
+            horizontalInside: BorderSide(color: Colors.grey.shade100, width: 1),
+          ),
           columns: const [
-            DataColumn(label: Text('S.no')),
-            DataColumn(label: Text('BARCODE')),
-            DataColumn(label: Text('GWT')),
-            DataColumn(label: Text('LOOSE')),
-            DataColumn(label: Text('NO OF B')),
-            DataColumn(label: Text('QTY')),
+            DataColumn(label: Text('SNO', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12))),
+            DataColumn(label: Text('BARCODE', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12))),
+            DataColumn(label: Text('TYPE', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12))),
+            DataColumn(label: Text('GWT', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12))),
+            DataColumn(label: Text('QTY', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12))),
+            DataColumn(label: Text('PHOTO', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12))),
+            DataColumn(label: Text('DATE & TIME', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12))),
           ],
-          rows: items.asMap().entries.map((entry) {
-            final item = entry.value;
+          rows: items.map((item) {
+            // Parse the date string safely
+            String rawDate = item['scanned_at']?.toString() ?? '';
+            String formattedDate = '-';
+            String formattedTime = '';
+
+            if (rawDate.isNotEmpty && rawDate != '0') {
+              try {
+                DateTime dt = DateTime.parse(rawDate);
+                formattedDate = DateFormat('dd-MM-yyyy').format(dt);
+                formattedTime = DateFormat('hh:mm a').format(dt);
+              } catch (e) {
+                formattedDate = rawDate; // Fallback to raw string if parsing fails
+              }
+            }
+
             return DataRow(cells: [
-              DataCell(Text((entry.key + 1).toString())),
-              DataCell(Text(item['barcode'] ?? '')),
-              DataCell(Text(item['gwt'] ?? '0')),
-              DataCell(Text(item['loose'] ?? '0')),
-              DataCell(Text(item['noOfB'] ?? '0')),
-              DataCell(Text(item['qty'] ?? '0')),
+              DataCell(Text(item['sno']?.toString() ?? '-')),
+              DataCell(Text(item['barcode'] ?? '-', style: const TextStyle(fontSize: 12))),
+              // Badge UI for Item Type
+              DataCell(_buildTypeBadge(item['item_type']?.toString() ?? 'N/A')),
+              DataCell(Text(item['gwt'] ?? 'STD', style: const TextStyle(fontSize: 12))),
+              DataCell(Text(item['qty']?.toString() ?? '0', style: const TextStyle(fontWeight: FontWeight.bold))),
+              DataCell(IconButton(
+                icon: const Icon(Icons.image_search_rounded, color: Colors.blueAccent, size: 22),
+                onPressed: () => _viewImage(item['image']),
+              )),
+              // Two-line Date and Time display
+              DataCell(Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(formattedDate, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600)),
+                  if (formattedTime.isNotEmpty)
+                    Text(formattedTime, style: TextStyle(fontSize: 10, color: Colors.grey.shade600)),
+                ],
+              )),
             ]);
           }).toList(),
         ),
@@ -333,13 +282,57 @@ class _ScanHistoryScreenState extends State<ScanHistoryScreen> {
     );
   }
 
-  Widget _emptyState() => const Center(
+// Helper for professional Type Badge
+  Widget _buildTypeBadge(String type) {
+    Color color = type.toUpperCase() == 'BOX' ? Colors.blue : Colors.orange;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: color.withOpacity(0.5)),
+      ),
+      child: Text(
+        type.toUpperCase(),
+        style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.bold),
+      ),
+    );
+  }
+
+
+  void _openCameraScanner() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) => Container(
+        height: MediaQuery.of(context).size.height * 0.75,
+        decoration: const BoxDecoration(color: Colors.white, borderRadius: BorderRadius.vertical(top: Radius.circular(25))),
+        child: MobileScanner(
+          onDetect: (capture) {
+            final String code = capture.barcodes.first.rawValue ?? "";
+            if (code.isNotEmpty) {
+              Navigator.pop(context);
+              _searchController.text = code;
+              _searchData(code);
+            }
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _emptyState() => Center(
     child: Column(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
-        Icon(Icons.manage_search, size: 80, color: Colors.grey),
-        Text("Ready for Scan", style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
+        Icon(Icons.manage_search_rounded, size: 80, color: Colors.grey.shade300),
+        const Text("System Ready", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey)),
       ],
     ),
+  );
+
+  void _showSnackBar(String m, Color c) => ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(content: Text(m), backgroundColor: c, behavior: SnackBarBehavior.floating),
   );
 }

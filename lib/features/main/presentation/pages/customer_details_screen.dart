@@ -1,9 +1,9 @@
-
 import 'package:flutter/material.dart';
 import 'package:flutter_barcode_listener/flutter_barcode_listener.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:get_it/get_it.dart';
 import 'package:go_router/go_router.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import '../../../../core/network/api_client.dart';
 import '../../../../core/utils/routes_name.dart';
 import '../../../../core/widgets/custom_button.dart';
 import '../../../../core/widgets/custom_textField.dart';
@@ -39,9 +39,24 @@ class _CustomerDetailsPageState extends State<CustomerDetailsPage> {
     _billController.addListener(() => setState(() {}));
     _qtyController.addListener(() => setState(() {}));
     _boxCountController.addListener(() => setState(() {}));
+    _looseBoxController.addListener(() => setState(() {}));
   }
 
-  // FEATURE: CAMERA SCANNING LOGIC
+  // --- NEW: RESET LOGIC ---
+  void _resetForm() {
+    setState(() {
+      _pinController.clear();
+      _billController.clear();
+      _qtyController.clear();
+      _boxCountController.clear();
+      _looseBoxController.clear();
+      // Move focus back to the first field for the next entry
+      _pinFocus.requestFocus();
+    });
+  }
+
+  bool _isFilled(TextEditingController controller) => controller.text.trim().isNotEmpty;
+
   void _openCameraScanner(TextEditingController controller, FocusNode nextFocus) {
     showModalBottomSheet(
       context: context,
@@ -76,52 +91,41 @@ class _CustomerDetailsPageState extends State<CustomerDetailsPage> {
   }
 
   Future<void> _validateAndProceed() async {
-    if (!_formKey.currentState!.validate()) return; // Prevents Crash
-
+    if (!_formKey.currentState!.validate()) return;
     setState(() => _isChecking = true);
     try {
-      final String scannedPin = _pinController.text.trim();
-
-      var fallbackQuery = await FirebaseFirestore.instance
-          .collection('dispatches')
-          .orderBy('timestamp', descending: true)
-          .limit(50)
-          .get();
-
-      final bool alreadyExists = fallbackQuery.docs.any((doc) {
-        final List items = doc.get('items') ?? [];
-        return items.any((item) => item['barcode'] == scannedPin);
-      });
+      final String billNo = _billController.text.trim();
+      final response = await GetIt.I<ApiClient>().get('/api/dispatches/', queryParams: {'search': billNo});
+      List results = response.data['data'] ?? [];
+      bool alreadyExists = results.any((d) => d['bill_no'] == billNo);
 
       if (alreadyExists) {
-        _showWarning("ALREADY SCANNED: This PIN exists in records!");
-        _pinController.clear();
-        _pinFocus.requestFocus();
+        _showWarning("EXISTING BILL: #$billNo is already verified!");
+        _billFocus.requestFocus();
       } else {
         if (mounted) {
-          context.pushNamed(
-            AppRoutes.scanScreen,
-            queryParameters: {
-              "billNo": _billController.text.trim(),
-              "qty": _qtyController.text.trim(),
-              "boxes": _boxCountController.text.trim(),
-              "loose": _looseBoxController.text.trim(),
-              "pin": scannedPin,
-            },
-          );
+          // AWAIT the navigation. Execution will resume here once the scan screen is popped.
+          await context.pushNamed(AppRoutes.scanScreen, queryParameters: {
+            "billNo": billNo,
+            "qty": _qtyController.text.trim(),
+            "boxes": _boxCountController.text.trim(),
+            "loose": _looseBoxController.text.trim(),
+            "pin": _pinController.text.trim(),
+          });
+
+          // CLEAR ALL FIELDS AFTER SUCCESSFUL RETURN
+          _resetForm();
         }
       }
     } catch (e) {
-      _showWarning("Database Error: Verification failed.");
+      _showWarning("Connection Error: Server unreachable.");
     } finally {
       if (mounted) setState(() => _isChecking = false);
     }
   }
 
   void _showWarning(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(msg), backgroundColor: Colors.redAccent),
-    );
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), backgroundColor: Colors.redAccent));
   }
 
   @override
@@ -143,7 +147,7 @@ class _CustomerDetailsPageState extends State<CustomerDetailsPage> {
           if (_pinController.text.isEmpty) {
             _pinController.text = code;
             _billFocus.requestFocus();
-          } else if (_billController.text.isEmpty) {
+          } else if (_billController.text.isEmpty && _isFilled(_pinController)) {
             _billController.text = code;
             _qtyFocus.requestFocus();
           }
@@ -164,40 +168,45 @@ class _CustomerDetailsPageState extends State<CustomerDetailsPage> {
                   onFieldSubmitted: (_) => _billFocus.requestFocus(),
                   validator: (v) => v!.isEmpty ? "PIN Required" : null,
                 ),
+
                 ScannerTextField(
                   label: "Invoice / Bill No", icon: Icons.receipt_long,
                   controller: _billController, focusNode: _billFocus,
-                  enabled: _pinController.text.isNotEmpty,
+                  enabled: _isFilled(_pinController),
                   suffixIcon: IconButton(
-                    icon: const Icon(Icons.camera_alt),
-                    onPressed: () => _openCameraScanner(_billController, _qtyFocus),
+                    icon:  Icon(Icons.camera_alt, color: _isFilled(_pinController) ? Colors.blueAccent : Colors.grey),
+                    onPressed: _isFilled(_pinController) ? () => _openCameraScanner(_billController, _qtyFocus) : null,
                   ),
                   onFieldSubmitted: (_) => _qtyFocus.requestFocus(),
                   validator: (v) => v!.isEmpty ? "Bill No Required" : null,
                 ),
+
                 ScannerTextField(
                   label: "QTY", icon: Icons.inventory_2,
                   controller: _qtyController, focusNode: _qtyFocus,
-                  enabled: _billController.text.isNotEmpty,
+                  enabled: _isFilled(_billController),
                   keyboardType: TextInputType.number,
                   onFieldSubmitted: (_) => _boxFocus.requestFocus(),
                   validator: (v) => v!.isEmpty ? "Qty Required" : null,
                 ),
+
                 ScannerTextField(
                   label: "Nos Of Box", icon: Icons.card_giftcard,
                   controller: _boxCountController, focusNode: _boxFocus,
-                  enabled: _qtyController.text.isNotEmpty,
+                  enabled: _isFilled(_qtyController),
                   keyboardType: TextInputType.number,
                   onFieldSubmitted: (_) => _looseFocus.requestFocus(),
                   validator: (v) => v!.isEmpty ? "Box count Required" : null,
                 ),
+
                 ScannerTextField(
                   label: "Loose Boxes", icon: Icons.unarchive,
                   controller: _looseBoxController, focusNode: _looseFocus,
-                  enabled: _boxCountController.text.isNotEmpty,
+                  enabled: _isFilled(_boxCountController),
                   keyboardType: TextInputType.number,
                   validator: (v) => v!.isEmpty ? "Enter 0 if none" : null,
                 ),
+
                 const SizedBox(height: 30),
                 if (_isChecking)
                   const CircularProgressIndicator()
@@ -205,7 +214,7 @@ class _CustomerDetailsPageState extends State<CustomerDetailsPage> {
                   CustomButton(
                     label: "PROCEED",
                     width: double.infinity,
-                    onPressed: _validateAndProceed,
+                    onPressed: _isFilled(_looseBoxController) ? _validateAndProceed : null,
                   ),
               ],
             ),

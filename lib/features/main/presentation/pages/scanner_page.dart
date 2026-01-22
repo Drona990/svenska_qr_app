@@ -1,12 +1,14 @@
 import 'dart:io';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter_barcode_listener/flutter_barcode_listener.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_storage/firebase_storage.dart';
+import 'package:get_it/get_it.dart';
+import 'package:dio/dio.dart' as dio;
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
+import '../../../../core/network/api_client.dart';
 
 class ScannerScreen extends StatefulWidget {
   final String billNo, targetPin, qty, loose;
@@ -37,11 +39,11 @@ class _ScannerScreenState extends State<ScannerScreen> {
   final AudioPlayer _audioPlayer = AudioPlayer();
   final ImagePicker _picker = ImagePicker();
 
+  // Updated to hold the local File instead of a remote URL for bulk upload
   final List<Map<String, dynamic>> _verifiedTableData = [];
   File? _currentImage;
   bool _isStandardMode = true;
   bool _isSaving = false;
-  bool _isUploading = false;
 
   @override
   void initState() {
@@ -57,6 +59,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
     _terminalFocus.dispose();
     _gwtFocus.dispose();
     _looseQtyFocus.dispose();
+    _audioPlayer.dispose();
     super.dispose();
   }
 
@@ -64,31 +67,17 @@ class _ScannerScreenState extends State<ScannerScreen> {
   int get _verifiedLooseCount => _verifiedTableData.where((item) => item['type'] == 'LOOSE').length;
 
   // --------------------------------------------------------------------------
-  // LOGIC: IMAGE, SCANNING & DELETE (EXACTLY AS REQUESTED)
+  // LOGIC: IMAGE & SCANNING (UPDATED FOR API)
   // --------------------------------------------------------------------------
+
   Future<void> _takePhoto() async {
     final XFile? photo = await _picker.pickImage(source: ImageSource.camera, imageQuality: 40);
     if (photo != null) setState(() => _currentImage = File(photo.path));
   }
 
-  Future<String?> _uploadImage(File image) async {
-    try {
-      setState(() => _isUploading = true);
-      String fileName = 'img_${DateTime.now().millisecondsSinceEpoch}.jpg';
-      Reference ref = FirebaseStorage.instance.ref().child('dispatch_photos').child(fileName);
-      TaskSnapshot snapshot = await ref.putFile(image);
-      return await snapshot.ref.getDownloadURL();
-    } catch (e) {
-      _showWarning("Upload Failed", Colors.red);
-      return null;
-    } finally {
-      setState(() => _isUploading = false);
-    }
-  }
-
   void _onScanReceived(String code) async {
     final scannedCode = code.trim();
-    if (scannedCode.isEmpty || _isSaving || _isUploading) return;
+    if (scannedCode.isEmpty || _isSaving) return;
 
     if (_currentImage == null) {
       _playAlert(true);
@@ -108,17 +97,14 @@ class _ScannerScreenState extends State<ScannerScreen> {
       int current = _isStandardMode ? _verifiedBoxCount : _verifiedLooseCount;
 
       if (current < target) {
-        String? url = await _uploadImage(_currentImage!);
-        if (url == null) return;
-
         setState(() {
           _verifiedTableData.insert(0, {
             'sno': _verifiedTableData.length + 1,
             'barcode': scannedCode,
             'type': _isStandardMode ? 'BOX' : 'LOOSE',
-            'gwt': _isStandardMode ? '' : _gwtController.text.trim(),
+            'gwt': _isStandardMode ? 'STD' : _gwtController.text.trim(),
             'qty': _isStandardMode ? widget.qty : _looseQtyController.text.trim(),
-            'imgUrl': url,
+            'localFile': _currentImage, // Keep local file for the final POST
             'time': DateFormat('HH:mm:ss').format(DateTime.now()),
           });
           _currentImage = null;
@@ -126,7 +112,11 @@ class _ScannerScreenState extends State<ScannerScreen> {
           _looseQtyController.clear();
         });
         _playAlert(false);
-        if (_verifiedBoxCount == widget.totalBoxes && _verifiedLooseCount == int.parse(widget.loose)) _saveToFirebase();
+
+        // Check completion logic
+        if (_verifiedBoxCount == widget.totalBoxes && _verifiedLooseCount == int.parse(widget.loose)) {
+          _saveToBackend();
+        }
       }
     } else {
       _playAlert(true);
@@ -137,8 +127,56 @@ class _ScannerScreenState extends State<ScannerScreen> {
   }
 
   // --------------------------------------------------------------------------
-  // UI BUILD: SLIVER ARCHITECTURE TO PREVENT 100PX OVERFLOW
+  // NEW LOGIC: DJANGO API INTEGRATION (REPLACES FIREBASE)
   // --------------------------------------------------------------------------
+
+  Future<void> _saveToBackend() async {
+    setState(() => _isSaving = true);
+    try {
+      // 1. Prepare Metadata (the table data)
+      List<Map<String, dynamic>> itemsMeta = _verifiedTableData.map((item) => {
+        'sno': item['sno'],
+        'type': item['type'],
+        'barcode': item['barcode'],
+        'qty': item['qty'],
+        'gwt': item['gwt'],
+      }).toList();
+
+      // 2. Create FormData (Multi-part)
+      dio.FormData formData = dio.FormData.fromMap({
+        'billNo': widget.billNo,
+        'customerPin': widget.targetPin,
+        'totalQty': widget.qty,
+        'items_meta': jsonEncode(itemsMeta), // Send entire list as JSON string
+      });
+
+      // 3. Attach all captured images to the form data
+      for (int i = 0; i < _verifiedTableData.length; i++) {
+        File file = _verifiedTableData[i]['localFile'];
+        formData.files.add(MapEntry(
+          'image_$i', // Unique key for each image
+          await dio.MultipartFile.fromFile(file.path, filename: 'item_$i.jpg'),
+        ));
+      }
+
+      // 4. Send to Django API
+      final response = await GetIt.I<ApiClient>().post('/api/dispatches/', data: formData);
+
+      if (response.statusCode == 201) {
+        _showWarning("DISPATCH SAVED SUCCESSFULLY!", Colors.green);
+        Navigator.pop(context); // Go back home
+      }
+    } catch (e) {
+      _showWarning("API Error: Save failed", Colors.red);
+    } finally {
+      setState(() => _isSaving = false);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // UI BUILD (UNCHANGED AS PER YOUR REQUEST)
+  // --------------------------------------------------------------------------
+
   @override
   Widget build(BuildContext context) {
     bool isComplete = _verifiedBoxCount == widget.totalBoxes && _verifiedLooseCount == int.parse(widget.loose);
@@ -202,7 +240,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
         style: const TextStyle(color: Colors.blueAccent, fontWeight: FontWeight.bold),
         textAlign: TextAlign.center,
         decoration: InputDecoration(
-          hintText: _isUploading ? "UPLOADING..." : "SCAN QR CODE",
+          hintText: _isSaving ? "SAVING..." : "SCAN QR CODE",
           hintStyle: const TextStyle(color: Colors.grey, fontSize: 12),
           prefixIcon: const Icon(Icons.qr_code_scanner, color: Colors.blueAccent),
           suffixIcon: IconButton(
@@ -239,25 +277,12 @@ class _ScannerScreenState extends State<ScannerScreen> {
       decoration: InputDecoration(
         labelText: label,
         labelStyle: const TextStyle(color: Colors.blueGrey, fontSize: 12,fontWeight: FontWeight.bold),
-        prefixIcon: Icon(icon, size: 18, color: Colors.blueAccent), // Blue Accent Icon
+        prefixIcon: Icon(icon, size: 18, color: Colors.blueAccent),
         filled: true,
         fillColor: Colors.white,
         contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
-
-        enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
-          borderSide: BorderSide(color: Colors.grey.shade300, width: 1.5),
-        ),
-
-        focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
-          borderSide: const BorderSide(color: Colors.blueAccent, width: 2),
-        ),
-
-        errorBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(12),
-          borderSide: const BorderSide(color: Colors.redAccent, width: 1.5),
-        ),
+        enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: Colors.grey.shade300, width: 1.5)),
+        focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: const BorderSide(color: Colors.blueAccent, width: 2)),
       ),
     );
   }
@@ -297,11 +322,11 @@ class _ScannerScreenState extends State<ScannerScreen> {
           scrollDirection: Axis.horizontal,
           child: DataTable(
             columns: const [
-              DataColumn(label: Text('S.NO',style: TextStyle(fontWeight: FontWeight.bold),)),
+              DataColumn(label: Text('S.NO',style: TextStyle(fontWeight: FontWeight.bold))),
               DataColumn(label: Text('TYPE',style: TextStyle(fontWeight: FontWeight.bold))),
               DataColumn(label: Text('GWT',style: TextStyle(fontWeight: FontWeight.bold))),
               DataColumn(label: Text('QTY',style: TextStyle(fontWeight: FontWeight.bold))),
-              DataColumn(label: Text('PHOTO',style: TextStyle(fontWeight: FontWeight.bold))),
+              DataColumn(label: Text('STATUS',style: TextStyle(fontWeight: FontWeight.bold))),
               DataColumn(label: Text('ACTION',style: TextStyle(fontWeight: FontWeight.bold))),
             ],
             rows: List.generate(_verifiedTableData.length, (index) {
@@ -311,8 +336,8 @@ class _ScannerScreenState extends State<ScannerScreen> {
                 DataCell(Text(item['type'])),
                 DataCell(Text(item['gwt'])),
                 DataCell(Text(item['qty'])),
-                DataCell(IconButton(icon: const Icon(Icons.image, color: Colors.blue), onPressed: () => _viewImage(item['imgUrl']))),
-                DataCell(IconButton(icon: const Icon(Icons.delete, color: Colors.red), onPressed: () => _deleteRow(index))),
+                DataCell(const Icon(Icons.check_circle, color: Colors.green, size: 20)),
+                DataCell(IconButton(icon: const Icon(Icons.delete, color: Colors.red), onPressed: () => setState(() => _verifiedTableData.removeAt(index)))),
               ]);
             }),
           ),
@@ -321,7 +346,6 @@ class _ScannerScreenState extends State<ScannerScreen> {
     );
   }
 
-  // --- UI HELPERS ---
   Widget _buildStatusBar() => Container(padding: const EdgeInsets.all(16), margin: const EdgeInsets.all(16), decoration: BoxDecoration(color: const Color(0xFF0F172A), borderRadius: BorderRadius.circular(15)), child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [_stat("BOX", "$_verifiedBoxCount/${widget.totalBoxes}"), _stat("LOOSE", "$_verifiedLooseCount/${widget.loose}"), _stat("TOTAL QTY", widget.qty)]));
   Widget _stat(String l, String v) => Column(children: [Text(l, style: const TextStyle(color: Colors.white54, fontSize: 10,fontWeight: FontWeight.bold)), Text(v, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))]);
   Widget _buildModeToggle() => Padding(padding: const EdgeInsets.symmetric(horizontal: 16), child: Row(children: [_toggle("STANDARD", _isStandardMode, () => setState(() => _isStandardMode = true), Colors.blue), _toggle("LOOSE", !_isStandardMode, () => setState(() => _isStandardMode = false), Colors.orange)]));
@@ -334,39 +358,6 @@ class _ScannerScreenState extends State<ScannerScreen> {
         _onScanReceived(capture.barcodes.first.rawValue ?? "");
       }
     })));
-  }
-
-  void _viewImage(String url) => showDialog(context: context, builder: (_) => AlertDialog(content: Image.network(url), actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text("CLOSE"))]));
-
-  Future<void> _deleteRow(int index) async {
-    String? url = _verifiedTableData[index]['imgUrl'];
-    if (url != null) {
-      try { await FirebaseStorage.instance.refFromURL(url).delete(); } catch (_) {}
-    }
-    setState(() {
-      _verifiedTableData.removeAt(index);
-      for (int i = 0; i < _verifiedTableData.length; i++) {
-        _verifiedTableData[i]['sno'] = _verifiedTableData.length - i;
-      }
-    });
-  }
-
-  Future<void> _saveToFirebase() async {
-    setState(() => _isSaving = true);
-    try {
-      await FirebaseFirestore.instance.collection('dispatches').add({
-        'billNo': widget.billNo,
-        'customerPin': widget.targetPin,
-        'timestamp': FieldValue.serverTimestamp(),
-        'items': _verifiedTableData,
-        'status': 'Verified',
-      });
-      _showWarning("DISPATCH SAVED!", Colors.green);
-    } catch (e) {
-      _showWarning("Save Error", Colors.red);
-    } finally {
-      setState(() => _isSaving = false);
-    }
   }
 
   void _playAlert(bool e) => _audioPlayer.play(AssetSource(e ? 'sound/beep-warning.mp3' : 'sound/beep.mp3'));

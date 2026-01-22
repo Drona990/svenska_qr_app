@@ -1,17 +1,15 @@
 import 'dart:io';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:get_it/get_it.dart';
+import 'package:dio/dio.dart' as dio_lib;
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter_barcode_listener/flutter_barcode_listener.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_storage/firebase_storage.dart'; // Added
-import 'package:image_picker/image_picker.dart'; // Added
-import 'package:path_provider/path_provider.dart';
-import 'package:pdf/pdf.dart';
-import 'package:pdf/widgets.dart' as pw;
-import 'package:printing/printing.dart';
-import 'package:excel/excel.dart' as excel_pkg;
+import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
+import '../../../../core/network/api_client.dart';
+import '../../../../core/utils/constant/Endpoints.dart';
 
 class DesktopDispatchWorkstation extends StatefulWidget {
   const DesktopDispatchWorkstation({super.key});
@@ -28,111 +26,137 @@ class _DesktopDispatchWorkstationState extends State<DesktopDispatchWorkstation>
   final _looseController = TextEditingController();
 
   final _gwtController = TextEditingController();
-  final _looseQtyController = TextEditingController(); // Added for Loose Qty
+  final _looseQtyController = TextEditingController();
   final FocusNode _gwtFocus = FocusNode();
-  final FocusNode _looseQtyFocus = FocusNode(); // Added focus for Loose Qty
+  final FocusNode _looseQtyFocus = FocusNode();
 
   final List<Map<String, dynamic>> _liveItems = [];
   bool _isStandardMode = true;
   bool _isSaving = false;
-  bool _isUploading = false; // Added loading state for image upload
-
-  File? _currentImage; // Added to store selected file
-  final ImagePicker _picker = ImagePicker(); // Added picker instance
+  bool _isCheckingBill = false;
+  File? _currentImage;
+  final ImagePicker _picker = ImagePicker();
 
   final FocusNode _masterFocus = FocusNode();
   final TextEditingController _terminalController = TextEditingController();
   final AudioPlayer _audioPlayer = AudioPlayer();
 
-  final TextEditingController _historySearchController = TextEditingController();
-  QuerySnapshot? _historySearchResult;
+  // Archive State
+  List<dynamic>? _historySearchResult;
   bool _isHistoryLoading = false;
   bool _showHistoryOnly = false;
 
   int get _verifiedBoxCount => _liveItems.where((item) => item['type'] == 'BOX').length;
   int get _verifiedLooseCount => _liveItems.where((item) => item['type'] == 'LOOSE').length;
 
-  bool get _isConfigComplete {
-    return _pinController.text.isNotEmpty &&
-        _billController.text.isNotEmpty &&
-        _qtyController.text.isNotEmpty &&
-        _boxController.text.isNotEmpty &&
-        _looseController.text.isNotEmpty;
-  }
+  bool get _isConfigComplete =>
+      _pinController.text.isNotEmpty && _billController.text.isNotEmpty &&
+          _qtyController.text.isNotEmpty && _boxController.text.isNotEmpty && _looseController.text.isNotEmpty;
 
   @override
   void initState() {
     super.initState();
-    List<TextEditingController> ctrls = [
-      _pinController, _billController, _qtyController,
-      _boxController, _looseController, _gwtController, _looseQtyController
-    ];
-    for (var controller in ctrls) {
-      controller.addListener(() => setState(() {}));
-    }
+    List<TextEditingController> ctrls = [_pinController, _billController, _qtyController, _boxController, _looseController, _gwtController, _looseQtyController];
+    for (var c in ctrls) { c.addListener(() => setState(() {})); }
   }
 
-  // --- NEW: IMAGE PICKER LOGIC ---
-  Future<void> _pickImage() async {
-    final XFile? image = await _picker.pickImage(source: ImageSource.gallery);
-    if (image != null) {
-      setState(() => _currentImage = File(image.path));
-    }
-  }
-
-  // --- NEW: FIREBASE STORAGE UPLOAD ---
-  Future<String?> _uploadImage(File image) async {
+  String _formatDateTime(String? rawDate) {
+    if (rawDate == null || rawDate.isEmpty) return "Date N/A";
     try {
-      setState(() => _isUploading = true);
-      String fileName = 'dsktp_${DateTime.now().millisecondsSinceEpoch}.jpg';
-      Reference ref = FirebaseStorage.instance.ref().child('dispatch_photos').child(fileName);
-      TaskSnapshot snapshot = await ref.putFile(image);
-      return await snapshot.ref.getDownloadURL();
+      DateTime dt = DateTime.parse(rawDate);
+      return DateFormat('dd-MM-yyyy  |  hh:mm a').format(dt);
     } catch (e) {
-      _showSnack("Upload Failed: $e", Colors.red);
-      return null;
-    } finally {
-      setState(() => _isUploading = false);
+      return rawDate;
     }
   }
 
-  void _searchHistory(String query) async {
-    if (query.isEmpty) return;
-    setState(() {
-      _isHistoryLoading = true;
-      _historySearchResult = null;
-    });
-
+  Future<void> _checkBillAndActivate() async {
+    setState(() => _isCheckingBill = true);
     try {
-      final String searchTerm = query.trim();
-      var result = await FirebaseFirestore.instance.collection('dispatches').where(
-        Filter.or(
-          Filter('billNo', isEqualTo: searchTerm),
-          Filter('customerPin', isEqualTo: searchTerm),
-        ),
-      ).get();
+      final res = await GetIt.I<ApiClient>().get('/api/dispatches/', queryParams: {'search': _billController.text.trim()});
+      List results = res.data['data'] ?? [];
+      bool exists = results.any((d) => d['bill_no'] == _billController.text.trim());
 
-      setState(() {
-        _historySearchResult = result;
-        _isHistoryLoading = false;
+      if (exists) {
+        _playAlert(true);
+        _showSnack("ERROR: Bill No already exists!", Colors.red);
+      } else {
+        _masterFocus.requestFocus();
+        _showSnack("Terminal Ready", Colors.blue);
+      }
+    } catch (e) { _showSnack("Check failed", Colors.orange); }
+    finally { setState(() => _isCheckingBill = false); }
+  }
+
+  Future<void> _saveToBackend() async {
+    setState(() => _isSaving = true);
+    try {
+      // 1. Prepare Metadata JSON
+      List<Map<String, dynamic>> itemsMeta = _liveItems.map((item) {
+        return {
+          'sno': item['sno'],
+          'type': item['type'],
+          'barcode': item['barcode'],
+          'qty': item['qty'],
+          'gwt': item['gwt'],
+        };
+      }).toList();
+
+      dio_lib.FormData formData = dio_lib.FormData.fromMap({
+        'billNo': _billController.text,
+        'customerPin': _pinController.text,
+        'totalQty': _qtyController.text,
+        'items_meta': jsonEncode(itemsMeta),
       });
+
+      // 3. Attach local images with indexed keys image_0, image_1...
+      for (int i = 0; i < _liveItems.length; i++) {
+        if (_liveItems[i]['localFile'] != null) {
+          formData.files.add(MapEntry(
+            'image_$i',
+            await dio_lib.MultipartFile.fromFile(
+                _liveItems[i]['localFile'].path,
+                filename: 'item_$i.jpg'
+            ),
+          ));
+        }
+      }
+
+      // 4. Send via registered ApiClient
+      final response = await GetIt.I<ApiClient>().post(
+          '/api/dispatches/',
+          data: formData
+      );
+
+      if (response.statusCode == 201) {
+        _showSnack("Dispatch Saved to Local Server!", Colors.green);
+        _resetStation();
+      }
     } catch (e) {
-      setState(() => _isHistoryLoading = false);
+      _showSnack("Failed to reach server", Colors.red);
+    } finally {
+      setState(() => _isSaving = false);
     }
+  }
+
+  void _searchHistory(String q) async {
+    setState(() { _isHistoryLoading = true; _historySearchResult = null; });
+    try {
+      final res = await GetIt.I<ApiClient>().get('/api/dispatches/', queryParams: {'search': q.trim()});
+      setState(() { _historySearchResult = res.data['data']; _isHistoryLoading = false; });
+    } catch (e) { setState(() => _isHistoryLoading = false); }
   }
 
   void _onScanReceived(String code) async {
     final scannedCode = code.trim();
-    if (scannedCode.isEmpty || _isSaving || _isUploading || !_isConfigComplete) return;
+    if (scannedCode.isEmpty || _isSaving || !_isConfigComplete) return;
 
-    // MANDATORY PHOTO CHECK
     if (_currentImage == null) {
       _playAlert(true);
       _showSnack("REQUIRED: Please select item image first!", Colors.red);
       return;
     }
 
-    // LOOSE SCAN LOGIC: Verify GWT and Qty
     if (!_isStandardMode) {
       if (_gwtController.text.isEmpty || _looseQtyController.text.isEmpty) {
         _playAlert(true);
@@ -149,10 +173,6 @@ class _DesktopDispatchWorkstationState extends State<DesktopDispatchWorkstation>
 
     if (scannedCode == _pinController.text) {
       if (current < target) {
-        // Upload image first
-        String? imageUrl = await _uploadImage(_currentImage!);
-        if (imageUrl == null) return;
-
         setState(() {
           _liveItems.insert(0, {
             'sno': _liveItems.length + 1,
@@ -160,11 +180,10 @@ class _DesktopDispatchWorkstationState extends State<DesktopDispatchWorkstation>
             'type': _isStandardMode ? 'BOX' : 'LOOSE',
             'qty': _isStandardMode ? _qtyController.text : _looseQtyController.text,
             'gwt': _isStandardMode ? 'STD' : _gwtController.text,
-            'imgUrl': imageUrl,
+            'localFile': _currentImage,
             'time': DateFormat('yyyy-MM-dd HH:mm:ss').format(DateTime.now()),
           });
-
-          _currentImage = null; // Clear image for next scan
+          _currentImage = null;
           if (!_isStandardMode) {
             _gwtController.clear();
             _looseQtyController.clear();
@@ -174,10 +193,10 @@ class _DesktopDispatchWorkstationState extends State<DesktopDispatchWorkstation>
 
         if (_verifiedBoxCount == (int.tryParse(_boxController.text) ?? 0) &&
             _verifiedLooseCount == (int.tryParse(_looseController.text) ?? 0)) {
-          _saveToFirebase();
+          _saveToBackend();
         }
       } else {
-        _showSnack("${_isStandardMode ? 'Boxes' : 'Loose Items'} Completed!", Colors.orange);
+        _showSnack("Verification Completed!", Colors.orange);
       }
     } else {
       _playAlert(true);
@@ -187,60 +206,8 @@ class _DesktopDispatchWorkstationState extends State<DesktopDispatchWorkstation>
     _masterFocus.requestFocus();
   }
 
-  void _deleteRow(int index) async {
-    // Delete image from storage to save space
-    String? url = _liveItems[index]['imgUrl'];
-    if (url != null) {
-      try {
-        await FirebaseStorage.instance.refFromURL(url).delete();
-      } catch (e) {
-        debugPrint("Error deleting image: $e");
-      }
-    }
 
-    setState(() {
-      _liveItems.removeAt(index);
-      for (int i = 0; i < _liveItems.length; i++) {
-        _liveItems[i]['sno'] = _liveItems.length - i;
-      }
-    });
-    _showSnack("Row Deleted", Colors.black);
-  }
-
-  Future<void> _saveToFirebase() async {
-    setState(() => _isSaving = true);
-    try {
-      await FirebaseFirestore.instance.collection('dispatches').add({
-        'billNo': _billController.text,
-        'customerPin': _pinController.text,
-        'timestamp': FieldValue.serverTimestamp(),
-        'items': _liveItems,
-        'status': 'Verified',
-      });
-      _showSnack("Dispatch Saved Successfully!", Colors.green);
-      _resetStation();
-    } catch (e) {
-      _showSnack("Upload Error", Colors.red);
-    } finally {
-      setState(() => _isSaving = false);
-    }
-  }
-
-  void _resetStation() {
-    _pinController.clear(); _billController.clear(); _qtyController.clear();
-    _boxController.clear(); _looseController.clear(); _liveItems.clear();
-    _terminalController.clear(); _gwtController.clear(); _looseQtyController.clear();
-    _currentImage = null;
-  }
-
-  void _playAlert(bool isError) {
-    _audioPlayer.play(AssetSource(isError ? 'sound/beep-warning.mp3' : 'sound/beep.mp3'));
-    if (isError) HapticFeedback.heavyImpact();
-  }
-
-  void _showSnack(String m, Color c) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m), backgroundColor: c));
-  }
+  // --- UI ---
 
   @override
   Widget build(BuildContext context) {
@@ -256,13 +223,7 @@ class _DesktopDispatchWorkstationState extends State<DesktopDispatchWorkstation>
                 Expanded(
                   child: Padding(
                     padding: const EdgeInsets.all(24.0),
-                    child: _showHistoryOnly ? _buildFullHistoryView() : Row(
-                      children: [
-                        Expanded(flex: 3, child: _buildEntryForm()),
-                        const SizedBox(width: 24),
-                        Expanded(flex: 6, child: _buildTerminalView()),
-                      ],
-                    ),
+                    child: _showHistoryOnly ? _buildFullHistoryView(): _buildMainStation(),
                   ),
                 ),
               ],
@@ -273,44 +234,31 @@ class _DesktopDispatchWorkstationState extends State<DesktopDispatchWorkstation>
     );
   }
 
-  Widget _buildSidebar() {
-    return Container(
-      width: 70, color: const Color(0xFF0F172A),
-      child: Column(
-        children: [
-          const SizedBox(height: 30),
-          const Icon(Icons.precision_manufacturing, color: Colors.blueAccent, size: 28),
-          const Spacer(),
-          IconButton(
-            icon: Icon(Icons.dashboard, color: !_showHistoryOnly ? Colors.blueAccent : Colors.white24),
-            onPressed: () => setState(() => _showHistoryOnly = false),
-          ),
-          const SizedBox(height: 20),
-          IconButton(
-            icon: Icon(Icons.history, color: _showHistoryOnly ? Colors.blueAccent : Colors.white24),
-            onPressed: () => setState(() => _showHistoryOnly = true),
-          ),
-          const SizedBox(height: 30),
-        ],
-      ),
-    );
-  }
+  Widget _buildMainStation() => Row(children: [
+    Expanded(flex: 3, child: _buildEntryForm()),
+    const SizedBox(width: 24),
+    Expanded(flex: 7, child: _buildTerminalView()),
+  ]);
 
-  Widget _buildHeader() {
-    return Container(
-      height: 60, color: Colors.white, padding: const EdgeInsets.symmetric(horizontal: 24),
-      child: Row(
-        children: [
-          Text(_showHistoryOnly ? "CENTRAL ARCHIVE" : "UNIFIED DISPATCH STATION",
-              style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 14)),
-          const Spacer(),
-          const Icon(Icons.circle, color: Colors.green, size: 12),
-          const SizedBox(width: 8),
-          const Text("SYSTEM ONLINE", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
-        ],
-      ),
-    );
-  }
+  Widget _buildSidebar() => Container(
+    width: 70, color: const Color(0xFF0F172A),
+    child: Column(children: [
+      const SizedBox(height: 30), const Icon(Icons.precision_manufacturing, color: Colors.blueAccent),
+      const Spacer(),
+      IconButton(icon: Icon(Icons.dashboard, color: !_showHistoryOnly ? Colors.blueAccent : Colors.white24), onPressed: () => setState(() => _showHistoryOnly = false)),
+      IconButton(icon: Icon(Icons.history, color: _showHistoryOnly ? Colors.blueAccent : Colors.white24), onPressed: () => setState(() => _showHistoryOnly = true)),
+      const SizedBox(height: 30),
+    ]),
+  );
+
+  Widget _buildHeader() => Container(
+    height: 60, color: Colors.white, padding: const EdgeInsets.symmetric(horizontal: 24),
+    child: Row(children: [
+      Text(_showHistoryOnly ? "ARCHIVE" : "DISPATCH WORK STATION", style: const TextStyle(fontWeight: FontWeight.w900)),
+      const Spacer(), const Icon(Icons.circle, color: Colors.green, size: 12),
+      const SizedBox(width: 8), const Text("ONLINE", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+    ]),
+  );
 
   Widget _buildEntryForm() {
     return Container(
@@ -326,143 +274,66 @@ class _DesktopDispatchWorkstationState extends State<DesktopDispatchWorkstation>
           _input("Boxes", _boxController, Icons.all_inbox),
           _input("Loose", _looseController, Icons.unarchive),
           const SizedBox(height: 30),
-
           ElevatedButton(
-            style: ElevatedButton.styleFrom(
-                backgroundColor: _isConfigComplete ? Colors.blueAccent : Colors.grey,
-                minimumSize: const Size(double.infinity, 50)
-            ),
-            onPressed: _isConfigComplete ? () => _masterFocus.requestFocus() : null,
-            child: Text(_isConfigComplete ? "ACTIVATE TERMINAL" : "COMPLETE FORM",
-                style: const TextStyle(color: Colors.white)),
+            style: ElevatedButton.styleFrom(backgroundColor: _isConfigComplete ? Colors.blueAccent : Colors.grey, minimumSize: const Size(double.infinity, 50)),
+            onPressed: (_isConfigComplete && !_isCheckingBill) ? _checkBillAndActivate : null,
+            child: _isCheckingBill ? const CircularProgressIndicator(color: Colors.white) : const Text("ACTIVATE", style: TextStyle(color: Colors.white)),
           )
+
         ],
       ),
     );
   }
 
-  Widget _buildTerminalView() {
-    double boxProgress = (int.tryParse(_boxController.text) ?? 0) > 0
-        ? _verifiedBoxCount / int.parse(_boxController.text) : 0.0;
-    double looseProgress = (int.tryParse(_looseController.text) ?? 0) > 0
-        ? _verifiedLooseCount / int.parse(_looseController.text) : 0.0;
+  Widget _buildTerminalView() => BarcodeKeyboardListener(
+    onBarcodeScanned: _onScanReceived,
+    child: Column(children: [
+      Row(children: [
+        _progressCard("BOXES", "$_verifiedBoxCount/${_boxController.text}", Colors.blue, _isStandardMode),
+        const SizedBox(width: 16),
+        _progressCard("LOOSE", "$_verifiedLooseCount/${_looseController.text}", Colors.orange, !_isStandardMode),
+      ]),
+      const SizedBox(height: 16),
+      Row(children: [
+        _modeBtn("STANDARD", Colors.blue, _isStandardMode, () => setState(() => _isStandardMode = true)),
+        _modeBtn("LOOSE", Colors.orange, !_isStandardMode, () => setState(() => _isStandardMode = false)),
+      ]),
+      const SizedBox(height: 16),
+      _buildPhotoPicker(),
+      if (!_isStandardMode) _buildLooseInputs(),
+      const SizedBox(height: 16),
+      _buildScanField(),
+      const SizedBox(height: 16),
+      Expanded(
+        child: Container(
+          width: double.infinity,
+          alignment: Alignment.topLeft,
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: _buildDataTable(),
+        ),
+      )
+    ]),
+  );
 
-    return BarcodeKeyboardListener(
-      onBarcodeScanned: _onScanReceived,
-      child: Column(
-        children: [
-          Row(
-            children: [
-              _progressCard("BOXES", "$_verifiedBoxCount/${_boxController.text}", boxProgress, Colors.blue, _isStandardMode),
-              const SizedBox(width: 16),
-              _progressCard("LOOSE", "$_verifiedLooseCount/${_looseController.text}", looseProgress, Colors.orange, !_isStandardMode),
-            ],
-          ),
-          const SizedBox(height: 16),
-          Row(
-            children: [
-              _modeBtn("STANDARD", Colors.blue, _isStandardMode, () => setState(() => _isStandardMode = true)),
-              _modeBtn("LOOSE", Colors.orange, !_isStandardMode, () => setState(() => _isStandardMode = false)),
-            ],
-          ),
-          const SizedBox(height: 16),
+  Widget _buildPhotoPicker() => Container(
+    padding: const EdgeInsets.all(12), decoration: BoxDecoration(color: _currentImage == null ? Colors.red.withValues(alpha: 0.05) : Colors.green.withValues(alpha: 0.05), borderRadius: BorderRadius.circular(12), border: Border.all(color: _currentImage == null ? Colors.red : Colors.green)),
+    child: Row(children: [
+      Icon(_currentImage == null ? Icons.camera_alt : Icons.check_circle, color: _currentImage == null ? Colors.red : Colors.green),
+      const SizedBox(width: 12), Text(_currentImage == null ? "CAPTURE PHOTO" : "READY"),
+      const Spacer(),
+      if (_currentImage != null) ClipRRect(borderRadius: BorderRadius.circular(8), child: Image.file(_currentImage!, width: 40, height: 40, fit: BoxFit.cover)),
+      const SizedBox(width: 10),
+      ElevatedButton(onPressed: _pickImage, child: const Text("PHOTO")),
+    ]),
+  );
 
-          // --- NEW: PHOTO PICKER SECTION ---
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: _currentImage == null ? Colors.red.withOpacity(0.05) : Colors.green.withOpacity(0.05),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: _currentImage == null ? Colors.red : Colors.green),
-            ),
-            child: Row(
-              children: [
-                Icon(_currentImage == null ? Icons.image_not_supported : Icons.check_circle,
-                    color: _currentImage == null ? Colors.red : Colors.green),
-                const SizedBox(width: 12),
-                Text(_currentImage == null ? "CAPTURE PHOTO (MANDATORY)" : "PHOTO READY",
-                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-                const Spacer(),
-                if (_currentImage != null)
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(8),
-                    child: Image.file(_currentImage!, width: 40, height: 40, fit: BoxFit.cover),
-                  ),
-                const SizedBox(width: 10),
-                ElevatedButton.icon(
-                  onPressed: _pickImage,
-                  icon: const Icon(Icons.file_upload, size: 16),
-                  label: const Text("SELECT IMAGE", style: TextStyle(fontSize: 10)),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 16),
-
-          // GWT and Qty Inputs: Only visible in Loose mode
-          if (!_isStandardMode)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 16.0),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _gwtController,
-                      focusNode: _gwtFocus,
-                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                      decoration: InputDecoration(
-                        labelText: "Gross Weight (GWT)",
-                        prefixIcon: const Icon(Icons.scale, size: 18),
-                        filled: true,
-                        fillColor: Colors.white,
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                      ),
-                      onSubmitted: (_) => _looseQtyFocus.requestFocus(),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: TextField(
-                      controller: _looseQtyController,
-                      focusNode: _looseQtyFocus,
-                      keyboardType: TextInputType.number,
-                      decoration: InputDecoration(
-                        labelText: "Loose Qty",
-                        prefixIcon: const Icon(Icons.format_list_numbered, size: 18),
-                        filled: true,
-                        fillColor: Colors.white,
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                      ),
-                      onSubmitted: (_) => _masterFocus.requestFocus(),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-
-          TextField(
-            controller: _terminalController, focusNode: _masterFocus,
-            enabled: _isConfigComplete && !_isUploading,
-            onSubmitted: _onScanReceived,
-            decoration: InputDecoration(
-              filled: true, fillColor: _isConfigComplete ? Colors.white : Colors.grey[200],
-              hintStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.grey),
-              hintText: _isUploading ? "UPLOADING PHOTO..." : (_isConfigComplete ? "SCAN NOW..." : "LOCKED"),
-              prefixIcon: const Icon(Icons.qr_code_scanner),
-              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
-            ),
-          ),
-          const SizedBox(height: 16),
-          Expanded(
-            child: Container(
-              width: double.infinity, decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
-              child: _buildDataTable(),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+  Widget _buildScanField() => TextField(
+    controller: _terminalController, focusNode: _masterFocus, enabled: _isConfigComplete && !_isSaving, onSubmitted: _onScanReceived,
+    decoration: InputDecoration(filled: true, fillColor: Colors.white, hintText: _isSaving ? "SAVING..." : "SCAN NOW", prefixIcon: const Icon(Icons.qr_code_scanner), border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
+  );
 
   Widget _buildDataTable() {
     return SingleChildScrollView(
@@ -470,7 +341,7 @@ class _DesktopDispatchWorkstationState extends State<DesktopDispatchWorkstation>
         columns: const [
           DataColumn(label: Text("S.NO")),
           DataColumn(label: Text("TYPE")),
-          DataColumn(label: Text("PHOTO")), // Added column
+          DataColumn(label: Text("PHOTO")),
           DataColumn(label: Text("QTY")),
           DataColumn(label: Text("GWT")),
           DataColumn(label: Text("TIME")),
@@ -481,264 +352,397 @@ class _DesktopDispatchWorkstationState extends State<DesktopDispatchWorkstation>
           return DataRow(cells: [
             DataCell(Text(item['sno'].toString())),
             DataCell(Text(item['type'], style: const TextStyle(fontWeight: FontWeight.bold))),
-            DataCell(
-              item['imgUrl'] != null
-                  ? IconButton(
-                icon: const Icon(Icons.image, color: Colors.blue, size: 20),
-                onPressed: () => _viewImage(item['imgUrl']),
-              )
-                  : const Text("No Image"),
-            ),
+            DataCell(item['localFile'] != null ? const Icon(Icons.image, color: Colors.blue) : const Text("MISSING")),
             DataCell(Text(item['qty'])),
             DataCell(Text(item['gwt'].toString())),
             DataCell(Text(item['time'].toString().substring(11, 19))),
-            DataCell(IconButton(
-              icon: const Icon(Icons.delete, color: Colors.redAccent, size: 20),
-              onPressed: () => _deleteRow(index),
-            )),
+            DataCell(IconButton(icon: const Icon(Icons.delete, color: Colors.red), onPressed: () => setState(() => _liveItems.removeAt(index)))),
           ]);
         }),
       ),
     );
   }
 
-  // --- NEW: VIEW IMAGE DIALOG ---
-  void _viewImage(String url) {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        contentPadding: EdgeInsets.zero,
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Image.network(url, loadingBuilder: (context, child, progress) {
-              if (progress == null) return child;
-              return const Padding(
-                padding: EdgeInsets.all(20.0),
-                child: CircularProgressIndicator(),
-              );
-            }),
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text("CLOSE"))
-          ],
-        ),
-      ),
-    );
-  }
-
-  // (Rest of the original search, history, excel, and print logic stays exactly the same)
-  // ... (Full history view, exportToExcel, printProfessional etc here)
-
   Widget _buildFullHistoryView() {
     return Container(
-      padding: const EdgeInsets.all(30),
-      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20)),
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8FAFC), // Slate 50
+        borderRadius: BorderRadius.circular(24),
+      ),
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // Header Area
           Row(
             children: [
-              const Text("DISPATCH ARCHIVE", style: TextStyle(fontSize: 24, fontWeight: FontWeight.w900)),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text("Central Archive",
+                      style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900, color: Color(0xFF1E293B))),
+                  Text("Review and audit previous dispatch cycles",
+                      style: TextStyle(fontSize: 14, color: Colors.blueGrey.shade400)),
+                ],
+              ),
               const Spacer(),
-              SizedBox(
-                width: 400,
-                child: TextField(
-                  onSubmitted: _searchHistory,
-                  decoration: InputDecoration(
-                    hintText: "Enter Bill or Pin...",
-                    prefixIcon: const Icon(Icons.search),
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                  ),
-                ),
-              )
+              _buildSearchBar(),
             ],
           ),
-          const SizedBox(height: 30),
-          Expanded(child: _buildHistoryList()),
+          const SizedBox(height: 32),
+
+          // Main History Area
+          Expanded(
+            child: _isHistoryLoading
+                ? const Center(child: CircularProgressIndicator(strokeWidth: 2))
+                : _historySearchResult == null || _historySearchResult!.isEmpty
+                ? _buildEmptyState()
+                : Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Left Side: List of Dispatches
+                Expanded(flex: 4, child: _buildHistoryList()),
+                const SizedBox(width: 24),
+                // Right Side: Details of Selected Dispatch (Optional / Implementation logic)
+              ],
+            ),
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildHistoryList() {
-    if (_historySearchResult == null) return const Center(child: Text("No data found"));
+  Widget _buildEmptyState() {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(Icons.manage_search, size: 80, color: Colors.blueGrey.withValues(alpha: 0.2)),
+          const SizedBox(height: 16),
+          const Text(
+              "No Dispatches Found",
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF64748B))
+          ),
+          const SizedBox(height: 8),
+          const Text(
+              "Try searching with a different Bill Number or Customer PIN",
+              style: TextStyle(color: Colors.grey)
+          ),
+        ],
+      ),
+    );
+  }
 
-    return ListView.builder(
-      itemCount: _historySearchResult!.docs.length,
+  Widget _buildSearchBar() {
+    return Container(
+      width: 450,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.03), blurRadius: 10, offset: const Offset(0, 4))],
+      ),
+      child: TextField(
+        onSubmitted: _searchHistory,
+        decoration: InputDecoration(
+          hintText: "Search by Bill No or Customer PIN...",
+          hintStyle: TextStyle(color: Colors.blueGrey.shade200, fontSize: 14),
+          prefixIcon: const Icon(Icons.search, color: Colors.blueAccent),
+          border: InputBorder.none,
+          contentPadding: const EdgeInsets.symmetric(vertical: 15),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHistoryList() {
+    return ListView.separated(
+      itemCount: _historySearchResult!.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 16),
       itemBuilder: (context, index) {
-        var doc = _historySearchResult!.docs[index];
-        Map<String, dynamic> data = doc.data() as Map<String, dynamic>;
+        var data = _historySearchResult![index];
         List items = data['items'] ?? [];
 
-        return Card(
-          elevation: 0,
-          margin: const EdgeInsets.only(bottom: 12),
-          shape: RoundedRectangleBorder(
-            side: const BorderSide(color: Color(0xFFE2E8F0)),
-            borderRadius: BorderRadius.circular(12),
+        return Container(
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: const Color(0xFFE2E8F0)),
           ),
           child: ExpansionTile(
-            title: Text("Bill: ${data['billNo']}", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-            subtitle: Text("PIN: ${data['customerPin']} | Items: ${items.length}", style: const TextStyle(fontSize: 11)),
-            trailing: Row(
-              mainAxisSize: MainAxisSize.min,
+            shape: const RoundedRectangleBorder(side: BorderSide.none),
+            tilePadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+            leading: Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                  color: Colors.blue.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(10)
+              ),
+              child: const Icon(Icons.inventory_2_outlined, color: Colors.blueAccent),
+            ),
+            title: Text(
+              "BILL #${data['bill_no']}",
+              style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1E293B)),
+            ),
+            subtitle: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                IconButton(
-                  icon: const Icon(Icons.file_download, color: Colors.green, size: 20),
-                  onPressed: () => _exportToExcel(data),
+                // Line 1: PIN and Item Count
+                Text(
+                  "PIN: ${data['customer_pin']}  •  ${items.length} Items Verified",
+                  style: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
                 ),
-                IconButton(
-                  icon: const Icon(Icons.print, color: Colors.blue, size: 20),
-                  onPressed: () => _printProfessional(data),
+                const SizedBox(height: 2),
+                // Line 2: Date and Time
+                Row(
+                  children: [
+                    const Icon(Icons.access_time, size: 12, color: Colors.grey),
+                    const SizedBox(width: 4),
+                    Text(
+                      _formatDateTime(data['created_at']),
+                      style: const TextStyle(fontSize: 11, color: Colors.grey, fontWeight: FontWeight.w500),
+                    ),
+                  ],
                 ),
               ],
             ),
+            trailing: _buildStatusBadge(data['status'] ?? "Verified"),
             children: [
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(16),
-                color: const Color(0xFFF8FAFC),
-                child: DataTable(
-                  headingRowHeight: 35,
-                  columns: const [
-                    DataColumn(label: Text("S.NO")),
-                    DataColumn(label: Text("TYPE")),
-                    DataColumn(label: Text("BARCODE")),
-                    DataColumn(label: Text("GWT")),
-                    DataColumn(label: Text("QTY")),
-                    DataColumn(label: Text("DATE/TIME")),
-                  ],
-                  rows: items.map((item) {
-                    return DataRow(cells: [
-                      DataCell(Text(item['sno'].toString())),
-                      DataCell(Text(item['type'])),
-                      DataCell(Text(item['barcode'])),
-                      DataCell(Text(item['gwt'] ?? 'N/A')),
-                      DataCell(Text(item['qty'] ?? 'N/A')),
-                      DataCell(Text(item['time'] ?? 'N/A')),
-                    ]);
-                  }).toList(),
-                ),
-              ),
+              _buildItemGrid(items),
             ],
           ),
+
         );
       },
     );
   }
 
-  Widget _input(String l, TextEditingController c, IconData i) => Padding(
-    padding: const EdgeInsets.only(bottom: 8),
-    child: TextField(
-      controller: c,
-      decoration: InputDecoration(
-        labelText: l,
-        labelStyle: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
-        prefixIcon: Icon(i, size: 18),
-        border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+  Widget _buildStatusBadge(String status) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: const Color(0xFFDCFCE7),
+        borderRadius: BorderRadius.circular(20),
       ),
-    ),
-  );
+      child: Text(status.toUpperCase(),
+          style: const TextStyle(color: Color(0xFF166534), fontSize: 10, fontWeight: FontWeight.bold)),
+    );
+  }
 
-  Widget _modeBtn(String t, Color c, bool a, VoidCallback o) => Expanded(
-    child: InkWell(
-      onTap: o,
-      child: Container(
-        height: 40, alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: a ? c : Colors.white,
-          border: Border.all(color: c),
-        ),
-        child: Text(t, style: TextStyle(color: a ? Colors.white : c, fontWeight: FontWeight.bold, fontSize: 11)),
+  Widget _buildItemGrid(List items) {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: Colors.grey.shade200),
+        borderRadius: BorderRadius.circular(8),
       ),
-    ),
-  );
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Professional Header
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            color: const Color(0xFFF8FAFC),
+            child: Row(
+              children: const [
+                SizedBox(width: 35, child: Center(child: Text("SNO", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF64748B))))),
+                SizedBox(width: 50, child: Center(child: Text("IMG", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF64748B))))),
+                Expanded(flex: 3, child: Center(child: Text("BARCODE", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF64748B))))),
+                Expanded(flex: 2, child: Center(child: Text("TYPE", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF64748B))))),
+                Expanded(flex: 2, child: Center(child: Text("GWT", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF64748B))))),
+                Expanded(flex: 2, child: Center(child: Text("QTY", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF64748B))))),
+                Expanded(flex: 3, child: Center(child: Text("TIME", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF64748B))))),
+              ],
+            ),
+          ),
 
-  Widget _progressCard(String title, String val, double progress, Color color, bool active) {
-    return Expanded(
-      child: Container(
-        padding: const EdgeInsets.all(15),
-        decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: active ? color : Colors.grey.shade200, width: active ? 2 : 1)
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+          // Item Rows
+          ListView.separated(
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            itemCount: items.length,
+            separatorBuilder: (_, __) => const Divider(height: 1, color: Color(0xFFF1F5F9)),
+            itemBuilder: (context, idx) {
+              final item = items[idx];
+
+              String formattedDate = "-";
+              String formattedTime = "";
+              if (item['scanned_at'] != null) {
+                try {
+                  DateTime dt = DateTime.parse(item['scanned_at']);
+                  formattedDate = DateFormat('dd-MM-yyyy').format(dt);
+                  formattedTime = DateFormat('hh:mm a').format(dt);
+                } catch (e) {
+                  formattedDate = "Error";
+                }
+              }
+
+              return InkWell(
+                onTap: () => _viewImage(item['image']),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  child: Row(
+                    children: [
+                      // SNO - Centered
+                      SizedBox(width: 35, child: Center(child: Text("${item['sno']}", style: const TextStyle(fontSize: 11, color: Color(0xFF475569))))),
+
+                      // Thumbnail - Centered
+                      SizedBox(
+                        width: 50,
+                        child: Center(
+                          child: Container(
+                            decoration: BoxDecoration(
+                              border: Border.all(color: Colors.grey.shade200),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(4),
+                              child: Image.network(
+                                "${Endpoints.baseUrl}${item['image']}",
+                                width: 32, height: 32, fit: BoxFit.cover,
+                                errorBuilder: (_, __, ___) => const Icon(Icons.image_not_supported, size: 18, color: Colors.grey),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+
+                      // Barcode - Centered
+                      Expanded(
+                          flex: 3,
+                          child: Center(child: Text(item['barcode'] ?? "-", style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: Colors.blueAccent)))
+                      ),
+
+                      // Type Badge - Centered
+                      Expanded(
+                          flex: 2,
+                          child: Center(child: _buildTypeBadge(item['item_type'] ?? "N/A"))
+                      ),
+
+                      // GWT - Centered
+                      Expanded(
+                          flex: 2,
+                          child: Center(child: Text(item['gwt'] ?? "STD", style: const TextStyle(fontSize: 11, color: Color(0xFF64748B))))
+                      ),
+
+                      // Qty - Centered
+                      Expanded(
+                          flex: 2,
+                          child: Center(child: Text("${item['qty']}", style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold)))
+                      ),
+
+                      // Scanned At - Centered
+                      Expanded(
+                        flex: 3,
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Text(formattedDate, style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w600)),
+                            Text(formattedTime, style: const TextStyle(fontSize: 9, color: Colors.grey)),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTypeBadge(String type) {
+    Color color = type.toUpperCase() == 'BOX' ? Colors.blue : Colors.orange;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: color.withValues(alpha: 0.04)),
+      ),
+      child: Text(
+        type,
+        textAlign: TextAlign.center,
+        style: TextStyle(color: color, fontSize: 9, fontWeight: FontWeight.bold),
+      ),
+    );
+  }
+
+  void _viewImage(String relativeUrl) {
+    final String fullUrl = relativeUrl.startsWith('http')
+        ? relativeUrl
+        : "${Endpoints.baseUrl}$relativeUrl";
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Item Verification Photo", style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+        contentPadding: EdgeInsets.zero,
+        clipBehavior: Clip.antiAlias,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Text(title, style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey)),
-            Text(val, style: TextStyle(fontSize: 24, fontWeight: FontWeight.w900, color: color)),
-            const SizedBox(height: 10),
-            LinearProgressIndicator(value: progress, color: color, backgroundColor: color.withOpacity(0.1)),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 400),
+              child: Image.network(
+                fullUrl,
+                fit: BoxFit.contain,
+                // Show progress while downloading from Django
+                loadingBuilder: (context, child, loadingProgress) {
+                  if (loadingProgress == null) return child;
+                  return Container(
+                    height: 200,
+                    alignment: Alignment.center,
+                    child: CircularProgressIndicator(
+                      value: loadingProgress.expectedTotalBytes != null
+                          ? loadingProgress.cumulativeBytesLoaded / loadingProgress.expectedTotalBytes!
+                          : null,
+                    ),
+                  );
+                },
+                // Handle 404 or Network issues
+                errorBuilder: (context, error, stackTrace) => Container(
+                  height: 200,
+                  color: Colors.grey[100],
+                  child: const Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.broken_image, color: Colors.red, size: 40),
+                      SizedBox(height: 10),
+                      Text("Image not found on server", style: TextStyle(fontSize: 12)),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            Container(
+              color: Colors.grey[50],
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text("CLOSE"),
+              ),
+            ),
           ],
         ),
       ),
     );
   }
 
-  Future<void> _exportToExcel(Map<String, dynamic> data) async {
-    var excel = excel_pkg.Excel.createExcel();
-    excel_pkg.Sheet sheetObject = excel['Dispatch_Report'];
+  Widget _input(String l, TextEditingController c, IconData i) => Padding(padding: const EdgeInsets.only(bottom: 8), child: TextField(controller: c, decoration: InputDecoration(labelText: l, prefixIcon: Icon(i, size: 18), border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)))));
+  Widget _modeBtn(String t, Color c, bool a, VoidCallback o) => Expanded(child: InkWell(onTap: o, child: Container(height: 40, alignment: Alignment.center, decoration: BoxDecoration(color: a ? c : Colors.white, border: Border.all(color: c)), child: Text(t, style: TextStyle(color: a ? Colors.white : c, fontWeight: FontWeight.bold)))));
+  Widget _progressCard(String t, String v, Color c, bool a) => Expanded(child: Container(padding: const EdgeInsets.all(15), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12), border: Border.all(color: a ? c : Colors.grey.shade200, width: a ? 2 : 1)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(t, style: const TextStyle(fontSize: 10)), Text(v, style: TextStyle(fontSize: 24, fontWeight: FontWeight.w900, color: c))])));
+  Widget _buildLooseInputs() => Padding(padding: const EdgeInsets.only(top: 16), child: Row(children: [Expanded(child: TextField(controller: _gwtController, focusNode: _gwtFocus, decoration: const InputDecoration(labelText: "GWT", border: OutlineInputBorder()))), const SizedBox(width: 10), Expanded(child: TextField(controller: _looseQtyController, focusNode: _looseQtyFocus, decoration: const InputDecoration(labelText: "Qty", border: OutlineInputBorder())))]));
 
-    sheetObject.appendRow([
-      excel_pkg.TextCellValue('S.No'),
-      excel_pkg.TextCellValue('Type'),
-      excel_pkg.TextCellValue('Barcode'),
-      excel_pkg.TextCellValue('GWT'),
-      excel_pkg.TextCellValue('QTY'),
-      excel_pkg.TextCellValue('Date/Time'),
-    ]);
-
-    List items = data['items'] ?? [];
-    for (var item in items) {
-      sheetObject.appendRow([
-        excel_pkg.IntCellValue(item['sno'] ?? 0),
-        excel_pkg.TextCellValue(item['type'] ?? ''),
-        excel_pkg.TextCellValue(item['barcode'] ?? ''),
-        excel_pkg.TextCellValue(item['gwt'] ?? 'N/A'),
-        excel_pkg.TextCellValue(item['qty'] ?? 'N/A'),
-        excel_pkg.TextCellValue(item['time'] ?? ''),
-      ]);
-    }
-
-    var fileBytes = excel.save();
-    final directory = await getApplicationDocumentsDirectory();
-    final file = File('${directory.path}/Bill_${data['billNo']}.xlsx');
-    await file.writeAsBytes(fileBytes!);
-    _showSnack("Excel saved to Documents", Colors.green);
-  }
-
-  Future<void> _printProfessional(Map<String, dynamic> data) async {
-    final pdf = pw.Document();
-    List items = data['items'] ?? [];
-
-    pdf.addPage(
-      pw.Page(
-        pageFormat: PdfPageFormat.a4,
-        build: (context) => pw.Padding(
-          padding: const pw.EdgeInsets.all(20),
-          child: pw.Column(
-            crossAxisAlignment: pw.CrossAxisAlignment.start,
-            children: [
-              pw.Text("DISPATCH MANIFEST", style: pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold)),
-              pw.SizedBox(height: 10),
-              pw.Divider(),
-              pw.SizedBox(height: 10),
-              pw.Row(children: [pw.Text("Bill No: "), pw.Text(data['billNo'], style: pw.TextStyle(fontWeight: pw.FontWeight.bold))]),
-              pw.Row(children: [pw.Text("Customer P/N: "), pw.Text(data['customerPin'])]),
-              pw.Row(children: [pw.Text("Verified Date: "), pw.Text(DateFormat('yyyy-MM-dd HH:mm').format(DateTime.now()))]),
-              pw.SizedBox(height: 20),
-              pw.TableHelper.fromTextArray(
-                headers: ['S.NO', 'TYPE', 'BARCODE', 'GWT', 'QTY','TIME'],
-                data: items.map((i) => [i['sno'], i['type'], i['barcode'], i['gwt'] ?? 'N/A', i['qty'], i['time'] ?? 'N/A']).toList(),
-                headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold),
-                headerDecoration: const pw.BoxDecoration(color: PdfColors.grey300),
-                cellAlignment: pw.Alignment.centerLeft,
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-    await Printing.layoutPdf(onLayout: (format) async => pdf.save());
+  void _resetStation() { _pinController.clear(); _billController.clear(); _qtyController.clear(); _boxController.clear(); _looseController.clear(); _liveItems.clear(); _terminalController.clear(); _currentImage = null; setState(() {}); _masterFocus.requestFocus(); }
+  void _playAlert(bool isError) { _audioPlayer.play(AssetSource(isError ? 'sound/beep-warning.mp3' : 'sound/beep.mp3')); if (isError) HapticFeedback.heavyImpact(); }
+  void _showSnack(String m, Color c) { ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m), backgroundColor: c)); }
+  Future<void> _pickImage() async {
+    final XFile? image = await _picker.pickImage(source: (Platform.isWindows) ? ImageSource.gallery : ImageSource.camera);
+    if (image != null) setState(() => _currentImage = File(image.path));
   }
 }

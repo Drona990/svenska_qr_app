@@ -1,4 +1,4 @@
 class Endpoints{
-  static const String baseUrl = "http://192.168.166.96:8000";
+  static const String baseUrl = "http://10.11.35.96:8000";
 
 }
